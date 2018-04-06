@@ -48,11 +48,6 @@ int main(int argc, char **argv)
     line = line.substr(line.find(" ") + 1);
     edges[e].weight = std::stod(line);
   }
-  // Sort edges by ascending first end.
-  std::sort(edges.begin(),
-            edges.end(),
-            [](const Edge &e1, const Edge &e2) -> bool
-              { return e1.end1 < e2.end1; });
   std::cout << "Loaded TSP with " << num_nodes << " nodes and "
                                   << num_edges << " edges.\n";
 
@@ -61,7 +56,9 @@ int main(int argc, char **argv)
   x.resize(num_edges);
 
   std::cout << "Computation begins.\n";
+  // Start timer.
   const auto t_start = std::chrono::high_resolution_clock::now();
+  // Solve TSP using Gurobi (for the LPs).
   try {
     solve_TSP(num_nodes, num_edges, edges, x);
   }
@@ -100,9 +97,6 @@ void solve_TSP(int                     num_nodes,
                const std::vector<Edge> &edges,
                std::vector<double>     &x)
 {
-  // Edge index
-  int e;
-
   // Set up environment.
   GRBEnv env;
   // Create initial model.
@@ -113,26 +107,20 @@ void solve_TSP(int                     num_nodes,
   GRBVar *vars = model.getVars();
   // Set up objective function.
   GRBLinExpr obj;
-  for (e = 0; e < num_edges; e++) {
+  for (int e = 0; e < num_edges; e++) {
     obj += GRBLinExpr(vars[e], edges[e].weight);
   }
   model.setObjective(obj, GRB_MINIMIZE);
   // Add initial constraints.
-  e = 0;
   for (int n = 0; n < num_nodes; n++) {
-    GRBLinExpr constr;
+    GRBLinExpr lhs;
     // Add all edges that are adjacent to the current node.
-    bool is_nonzero_constr = false;
-    while (edges[e].end1 == n) {
-      constr += GRBLinExpr(vars[e], 1.0);
-      is_nonzero_constr = true;
-      e++;
+    for (int e = 0; e < num_edges; e++) {
+      if (edges[e].end1 == n || edges[e].end2 == n) {
+        lhs += GRBLinExpr(vars[e], 1.0);
+      }
     }
-    // Only add nonzero constraints.
-    // Otherwise the model will be infeasible due to the constraint 0 = 2.
-    if (is_nonzero_constr) {
-      model.addConstr(constr, GRB_EQUAL, GRBLinExpr(2.0));
-    }
+    model.addConstr(lhs, GRB_EQUAL, GRBLinExpr(2.0));
   }
   model.update();
 
@@ -140,7 +128,7 @@ void solve_TSP(int                     num_nodes,
   model.optimize();
 
   // Extract solution.
-  for (e = 0; e < num_edges; e++) {
+  for (int e = 0; e < num_edges; e++) {
     x[e] = vars[e].get(GRB_DoubleAttr_X);
   }
 }
