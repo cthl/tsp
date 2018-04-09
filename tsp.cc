@@ -12,7 +12,7 @@
 // Gurobi
 #include "gurobi_c++.h"
 
-// Auxiliary function to decide whether or not a number is integral.
+// Auxiliary function to decide whether or not a number is integral
 bool is_integral(double d)
 {
   return std::fabs(d - std::round(d)) < 1.0e-9;
@@ -59,17 +59,14 @@ int main(int argc, char **argv)
   std::cout << "Loaded TSP with " << num_nodes << " nodes and "
                                   << num_edges << " edges.\n";
 
-  // Allocate memory for the solution.
-  std::vector<double> x;
-  x.resize(num_edges);
-
   std::cout << "Computation begins.\n";
   // Start timer.
   const auto t_start = std::chrono::high_resolution_clock::now();
   // Solve TSP using Gurobi (for the LPs).
+  std::vector<double> x_opt;
   int lp_solves;
   try {
-    solve_TSP(num_nodes, num_edges, edges, x, lp_solves);
+    solve_TSP(num_nodes, num_edges, edges, x_opt, lp_solves);
   }
   catch (const GRBException &e) {
     std::cerr << "Gurobi exception: " << e.getMessage() << std::endl;
@@ -91,12 +88,12 @@ int main(int argc, char **argv)
   double c_optimal = 0.0;
   for (int e = 0; e < num_edges; e++) {
     // See if the edge is used.
-    if (x[e] > 0.0) {
+    if (x_opt[e] > 0.0) {
       std::cout << edges[e].end1 << " "
                 << edges[e].end2 << " "
                 << std::setprecision(1)
                 << edges[e].weight << std::endl;
-      c_optimal += x[e]*edges[e].weight;
+      c_optimal += x_opt[e]*edges[e].weight;
     }
   }
   std::cout << "The cost of the best tour is: " << c_optimal << std::endl;
@@ -107,9 +104,13 @@ int main(int argc, char **argv)
 void solve_TSP(int                     num_nodes,
                int                     num_edges,
                const std::vector<Edge> &edges,
-               std::vector<double>     &x,
+               std::vector<double>     &x_opt,
                int                     &lp_solves)
 {
+  // Allocate memory for the solution.
+  std::vector<double> x;
+  x.resize(num_edges);
+
   // Set up environment.
   GRBEnv env;
   // Create initial model.
@@ -204,15 +205,16 @@ void solve_TSP(int                     num_nodes,
         // Print information about the queue.
         std::cout << "Branching; there are now "
                   << problems.size()
-                  << " models in the queue" << std::endl;
+                  << " models in the queue." << std::endl;
         // Stop after creating one branch!
         break;
       }
     }
 
-    // Update optimal cost if integral solution was found.
+    // Update optimal cost and optimal solution if integral solution was found.
     if (integral_sol) {
       opt_cost = cost;
+      x_opt = x;
     }
 
     // Clean up and remove current problem from queue.
