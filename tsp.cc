@@ -12,10 +12,13 @@
 // Gurobi
 #include "gurobi_c++.h"
 
+// Tolerance to determine whether or not a number is integral
+const double tol = 1.0e-9;
+
 // Auxiliary function to decide whether or not a number is integral
 bool is_integral(double d)
 {
-  return std::fabs(d - std::round(d)) < 1.0e-9;
+  return std::fabs(d - std::round(d)) < tol;
 }
 
 // Data structure to represent an edge of the input graph
@@ -31,7 +34,14 @@ void solve_TSP(int                     num_nodes,
                int                     num_edges,
                const std::vector<Edge> &edges,
                std::vector<double>     &x,
-               int                     &lp_solves);
+               int                     &lp_solves,
+               int                     &subtour_constraints);
+void find_components(int                       num_nodes,
+                     int                       num_edges,
+                     std::vector<Edge>         edges,
+                     const std::vector<double> &x,
+                     int                       &num_components,
+                     std::vector<int>          &components);
 
 int main(int argc, char **argv)
 {
@@ -65,8 +75,14 @@ int main(int argc, char **argv)
   // Solve TSP using Gurobi (for the LPs).
   std::vector<double> x_opt;
   int lp_solves;
+  int subtour_constraints;
   try {
-    solve_TSP(num_nodes, num_edges, edges, x_opt, lp_solves);
+    solve_TSP(num_nodes,
+              num_edges,
+              edges,
+              x_opt,
+              lp_solves,
+              subtour_constraints);
   }
   catch (const GRBException &e) {
     std::cerr << "Gurobi exception: " << e.getMessage() << std::endl;
@@ -80,8 +96,10 @@ int main(int argc, char **argv)
             << std::fixed << std::setprecision(3)
             << dtime.count() << "s).\n";
 
-  // Print number of LP solves.
+  // Print additional information.
   std::cout << "Solved a total of " << lp_solves << " LPs." << std::endl;
+  std::cout << "Added a total of " << subtour_constraints
+            << " subtour elimination constraints." << std::endl;
 
   // Print optimal solution.
   std::cout << "The best tour is:\n";
@@ -105,7 +123,8 @@ void solve_TSP(int                     num_nodes,
                int                     num_edges,
                const std::vector<Edge> &edges,
                std::vector<double>     &x_opt,
-               int                     &lp_solves)
+               int                     &lp_solves,
+               int                     &subtour_constraints)
 {
   // Allocate memory for the solution.
   std::vector<double> x;
@@ -113,6 +132,7 @@ void solve_TSP(int                     num_nodes,
 
   // Set up environment.
   GRBEnv env;
+  //env.set(GRB_IntParam_Presolve, 0);
   // Create initial model.
   GRBModel initial_model(env);
   // Add variables.
@@ -142,46 +162,100 @@ void solve_TSP(int                     num_nodes,
                             GRBLinExpr(1.0));
   }
   initial_model.update();
-  // Make sure that we don't use the wrong set of variables later.
-  delete[] vars;
-  vars = NULL;
 
   lp_solves = 0;
+  subtour_constraints = 0;
 
   // Branch and cut.
   double cost;
   double opt_cost = std::numeric_limits<double>::infinity();
+  int num_components;
+  std::vector<int> components;
   std::queue<GRBModel> problems;
   problems.push(initial_model);
   while (problems.size() > 0) {
     // Get next problem in queue.
     GRBModel &model = problems.front();
 
-    // Solve current model.
-    model.optimize();
-    lp_solves++;
+    // In this loop, the LP is solved repeatedly until a solution without
+    // subtours is found.
+    bool skipped = false;
+    while (true) {
+      // Solve current model.
+      model.optimize();
+      lp_solves++;
 
-    if (model.get(GRB_IntAttr_Status) != GRB_OPTIMAL) {
-      // Do not continue branch if problem is infeasible.
-      problems.pop();
-      continue;
+      if (model.get(GRB_IntAttr_Status) != GRB_OPTIMAL) {
+        // Do not continue branch if problem is infeasible.
+        problems.pop();
+        skipped = true;
+        break;
+      }
+
+      // Check cost.
+      cost = model.get(GRB_DoubleAttr_ObjVal);
+      if (cost >= opt_cost) {
+        // Cost is too high; stop following this branch.
+        problems.pop();
+        skipped = true;
+        break;
+      }
+
+      // Get current solution.
+      delete[] vars;
+      vars = model.getVars();
+      for (int e = 0; e < num_edges; e++) {
+        x[e] = vars[e].get(GRB_DoubleAttr_X);
+      }
+
+      // Find connected components of the solution and eliminate subtours.
+      find_components(num_nodes,
+                      num_edges,
+                      edges,
+                      x,
+                      num_components,
+                      components);
+
+      if (num_components == 1) {
+        // There are no more subtours that could be eliminated.
+        break;
+      }
+
+      // We will add one constraint per connected component.
+      std::vector<GRBLinExpr> lhs;
+      lhs.resize(num_components);
+      for (int e = 0; e < num_edges; e++) {
+        // Identify the component this edge belongs to.
+        const int c1 = components[edges[e].end1];
+        const int c2 = components[edges[e].end2];
+        // Skip edges that connect two different components.
+        if (c1 != c2) continue;
+        // Add edge to the subtour elimination constraint.
+        lhs[c1] += GRBLinExpr(vars[e], 1.0);
+      }
+      // Compute the size of each component.
+      // This is required for the right-hand side of the constraints.
+      std::vector<int> component_sizes;
+      component_sizes.resize(num_components);
+      for (int c = 0; c < num_components; c++) {
+        component_sizes[c] = 0;
+      }
+      for (int n = 0; n < num_nodes; n++) {
+        component_sizes[components[n]]++;
+      }
+      // Add constraints to model.
+      for (int c = 0; c < num_components; c++) {
+        model.addConstr(lhs[c],
+                        GRB_LESS_EQUAL,
+                        GRBLinExpr(component_sizes[c] - 1.0));
+        subtour_constraints++;
+      }
+      std::cout << "Added " << num_components
+                << " subtour elimination constraints." << std::endl;
+      model.update();
     }
 
-    // Check cost.
-    cost = model.get(GRB_DoubleAttr_ObjVal);
-    if (cost >= opt_cost) {
-      // Cost is too high; stop following this branch.
-      problems.pop();
-      continue;
-    }
-
-    // Get current solution.
-    vars = model.getVars();
-    for (int e = 0; e < num_edges; e++) {
-      x[e] = vars[e].get(GRB_DoubleAttr_X);
-    }
-
-    // Add subtour elimination here and go back to the LP solve...
+    if (skipped) continue;
 
     // Branch using a fractional variable.
     bool integral_sol = true;
@@ -205,7 +279,8 @@ void solve_TSP(int                     num_nodes,
         // Print information about the queue.
         std::cout << "Branching; there are now "
                   << problems.size()
-                  << " models in the queue." << std::endl;
+                  << " models in the queue."
+                  << std::endl << std::endl;
         // Stop after creating one branch!
         break;
       }
@@ -217,10 +292,78 @@ void solve_TSP(int                     num_nodes,
       x_opt = x;
     }
 
-    // Clean up and remove current problem from queue.
-    delete[] vars;
-    vars = NULL;
+    // Remove current problem from queue.
     problems.pop();
   }
+}
+
+void find_components(int                       num_nodes,
+                     int                       num_edges,
+                     std::vector<Edge>         edges,
+                     const std::vector<double> &x,
+                     int                       &num_components,
+                     std::vector<int>          &components)
+{
+  // Mark all unassigned nodes with -1.
+  components.resize(num_nodes);
+  for (int n = 0; n < num_nodes; n++) {
+    components[n] = -1;
+  }
+
+  // Component index
+  int c = 0;
+  // Node indices
+  int n1, n2;
+  // Find all connected components.
+  while (true) {
+    // Find an unassigned node.
+    n1 = -1;
+    for (int n = 0; n < num_nodes; n++) {
+      if (components[n] == -1) {
+        n1 = n;
+        break;
+      }
+    }
+    if (n1 == -1) {
+      // All nodes have been assigned.
+      break;
+    }
+
+    // Assign node to current component.
+    components[n1] = c;
+    // Mark the entire connected component.
+    while (true) {
+      // Find an unassigned connected node.
+      n2 = -1;
+      for (int e = 0; e < num_edges; e++) {
+        // Skip edges that are not used in the current solution.
+        if (x[e] < tol) continue;
+        if (edges[e].end1 == n1 && components[edges[e].end2] == -1) {
+          n2 = edges[e].end2;
+          break;
+        }
+        if (edges[e].end2 == n1 && components[edges[e].end1] == -1) {
+          n2 = edges[e].end1;
+          break;
+        }
+      }
+      // No connected node found. Continue with next component.
+      if (n2 == -1) break;
+
+      // Assign the connected node to the current component.
+      components[n2] = c;
+      // Merge the two nodes.
+      for (int e = 0; e < num_edges; e++) {
+        if (edges[e].end1 == n2) {
+          edges[e].end1 = n1;
+        }
+        if (edges[e].end2 == n2) {
+          edges[e].end2 = n1;
+        }
+      }
+    }
+    c++;
+  }
+  num_components = c;
 }
 
