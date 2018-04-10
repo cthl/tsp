@@ -7,19 +7,10 @@
 #include <cmath>
 #include <chrono>
 #include <vector>
-#include <queue>
+#include <deque>
 #include <limits>
 // Gurobi
 #include "gurobi_c++.h"
-
-// Tolerance to determine whether or not a number is integral
-const double tol = 1.0e-9;
-
-// Auxiliary function to decide whether or not a number is integral
-bool is_integral(double d)
-{
-  return std::fabs(d - std::round(d)) < tol;
-}
 
 // Data structure to represent an edge of the input graph
 struct Edge
@@ -29,99 +20,94 @@ struct Edge
   double weight;
 };
 
-// Function declarations
-void solve_TSP(int                     num_nodes,
-               int                     num_edges,
-               const std::vector<Edge> &edges,
-               std::vector<double>     &x,
-               int                     &lp_solves,
-               int                     &subtour_constraints);
+// If memory is limited, a soft limit for the maximum number of LPs in the
+// queue can be set for the branch and cut algorithm.
+// This is effectively disabled by default.
+const int lp_soft_limit = 1000000;
+
+// Tolerance to determine whether or not a number is integral
+const double tol = 1.0e-9;
+
+// Auxiliary function to decide whether or not a number is integral
+inline bool is_integral(double d)
+{
+  return std::fabs(d - std::round(d)) < tol;
+}
+
 void find_components(int                       num_nodes,
                      int                       num_edges,
                      std::vector<Edge>         edges,
                      const std::vector<double> &x,
                      int                       &num_components,
-                     std::vector<int>          &components);
-
-int main(int argc, char **argv)
+                     std::vector<int>          &components)
 {
-  // Read problem from stdin.
-  std::string line;
-  // Read problem size.
-  std::getline(std::cin, line);
-  // Remove leading spaces.
-  while (line[0] == ' ') line = line.substr(1);
-  const int num_nodes = std::stoi(line.substr(0, line.find(" ")));
-  const int num_edges = std::stoi(line.substr(line.find(" ") + 1));
-  // Read graph.
-  std::vector<Edge> edges;
-  edges.resize(num_edges);
-  for (int e = 0; e < num_edges; e++) {
-    std::getline(std::cin, line);
-    // Remove leading spaces.
-    while (line[0] == ' ') line = line.substr(1);
-    edges[e].end1 = std::stoi(line.substr(0, line.find(" ")));
-    line = line.substr(line.find(" ") + 1);
-    edges[e].end2 = std::stoi(line.substr(0, line.find(" ")));
-    line = line.substr(line.find(" ") + 1);
-    edges[e].weight = std::stod(line);
+  // Mark all unassigned nodes with -1.
+  components.resize(num_nodes);
+  for (int n = 0; n < num_nodes; n++) {
+    components[n] = -1;
   }
-  std::cout << "Loaded TSP with " << num_nodes << " nodes and "
-                                  << num_edges << " edges.\n";
 
-  std::cout << "Computation begins.\n";
-  // Start timer.
-  const auto t_start = std::chrono::high_resolution_clock::now();
-  // Solve TSP using Gurobi (for the LPs).
-  std::vector<double> x_opt;
-  int lp_solves;
-  int subtour_constraints;
-  try {
-    solve_TSP(num_nodes,
-              num_edges,
-              edges,
-              x_opt,
-              lp_solves,
-              subtour_constraints);
-  }
-  catch (const GRBException &e) {
-    std::cerr << "Gurobi exception: " << e.getMessage() << std::endl;
-    std::exit(1);
-  }
-  // Stop timer.
-  const auto t_end = std::chrono::high_resolution_clock::now();
-  const std::chrono::duration<double> dtime = t_end - t_start;
-
-  std::cout << "Computation finished (" 
-            << std::fixed << std::setprecision(3)
-            << dtime.count() << "s).\n";
-
-  // Print additional information.
-  std::cout << "Solved a total of " << lp_solves << " LPs." << std::endl;
-  std::cout << "Added a total of " << subtour_constraints
-            << " subtour elimination constraints." << std::endl;
-
-  // Print optimal solution.
-  std::cout << "The best tour is:\n";
-  double c_optimal = 0.0;
-  for (int e = 0; e < num_edges; e++) {
-    // See if the edge is used.
-    if (x_opt[e] > 0.0) {
-      std::cout << edges[e].end1 << " "
-                << edges[e].end2 << " "
-                << std::setprecision(1)
-                << edges[e].weight << std::endl;
-      c_optimal += x_opt[e]*edges[e].weight;
+  // Component index
+  int c = 0;
+  // Node indices
+  int n1, n2;
+  // Find all connected components.
+  while (true) {
+    // Find an unassigned node.
+    n1 = -1;
+    for (int n = 0; n < num_nodes; n++) {
+      if (components[n] == -1) {
+        n1 = n;
+        break;
+      }
     }
-  }
-  std::cout << "The cost of the best tour is: " << c_optimal << std::endl;
+    if (n1 == -1) {
+      // All nodes have been assigned.
+      break;
+    }
 
-  return 0;
+    // Assign node to current component.
+    components[n1] = c;
+    // Mark the entire connected component.
+    while (true) {
+      // Find an unassigned connected node.
+      n2 = -1;
+      for (int e = 0; e < num_edges; e++) {
+        // Skip edges that are not used in the current solution.
+        if (x[e] < tol) continue;
+        if (edges[e].end1 == n1 && components[edges[e].end2] == -1) {
+          n2 = edges[e].end2;
+          break;
+        }
+        if (edges[e].end2 == n1 && components[edges[e].end1] == -1) {
+          n2 = edges[e].end1;
+          break;
+        }
+      }
+      // No connected node found. Continue with next component.
+      if (n2 == -1) break;
+
+      // Assign the connected node to the current component.
+      components[n2] = c;
+      // Merge the two nodes.
+      for (int e = 0; e < num_edges; e++) {
+        if (edges[e].end1 == n2) {
+          edges[e].end1 = n1;
+        }
+        if (edges[e].end2 == n2) {
+          edges[e].end2 = n1;
+        }
+      }
+    }
+    c++;
+  }
+  num_components = c;
 }
 
 void solve_TSP(int                     num_nodes,
                int                     num_edges,
                const std::vector<Edge> &edges,
+               bool                    integral_weights,
                std::vector<double>     &x_opt,
                int                     &lp_solves,
                int                     &subtour_constraints)
@@ -132,7 +118,6 @@ void solve_TSP(int                     num_nodes,
 
   // Set up environment.
   GRBEnv env;
-  //env.set(GRB_IntParam_Presolve, 0);
   // Create initial model.
   GRBModel initial_model(env);
   // Add variables.
@@ -168,14 +153,15 @@ void solve_TSP(int                     num_nodes,
 
   // Branch and cut.
   double cost;
-  double opt_cost = std::numeric_limits<double>::infinity();
+  double cost_opt = std::numeric_limits<double>::infinity();
   int num_components;
   std::vector<int> components;
-  std::queue<GRBModel> problems;
-  problems.push(initial_model);
+  std::deque<GRBModel> problems;
+  problems.push_back(initial_model);
   while (problems.size() > 0) {
     // Get next problem in queue.
-    GRBModel &model = problems.front();
+    GRBModel model = problems.front();
+    problems.pop_front();
 
     // In this loop, the LP is solved repeatedly until a solution without
     // subtours is found.
@@ -187,16 +173,19 @@ void solve_TSP(int                     num_nodes,
 
       if (model.get(GRB_IntAttr_Status) != GRB_OPTIMAL) {
         // Do not continue branch if problem is infeasible.
-        problems.pop();
         skipped = true;
         break;
       }
 
-      // Check cost.
+      // Check cost. If it is too high, stop following this branch.
       cost = model.get(GRB_DoubleAttr_ObjVal);
-      if (cost >= opt_cost) {
-        // Cost is too high; stop following this branch.
-        problems.pop();
+      // We can cut off branches more aggressively when the weights,
+      // and thus the optimal cost, are integral.
+      if (integral_weights && cost > cost_opt - 1.0 + tol) {
+          skipped = true;
+          break;
+      }
+      if (cost > cost_opt) {
         skipped = true;
         break;
       }
@@ -268,14 +257,25 @@ void solve_TSP(int                     num_nodes,
                            GRB_LESS_EQUAL,
                            GRBLinExpr(std::floor(x[e])));
         model_le.update();
-        problems.push(model_le);
         // Add model with >= constraint for fractional variable.
         GRBModel model_ge(model);
         model_ge.addConstr(GRBLinExpr(vars[e], 1.0),
                            GRB_GREATER_EQUAL,
                            GRBLinExpr(std::ceil(x[e])));
         model_ge.update();
-        problems.push(model_ge);
+        // Check if the soft limit for the number of LPs is hit.
+        if (problems.size() < lp_soft_limit) {
+          // Add new problems at the end of the queue.
+          // This corresponds to breadth-first search.
+          problems.push_back(model_le);
+          problems.push_back(model_ge);
+        }
+        else {
+          // Add new problems at the beginning of the queue.
+          // This corresponds to depth-first search.
+          problems.push_front(model_le);
+          problems.push_front(model_ge);
+        }
         // Print information about the queue.
         std::cout << "Branching; there are now "
                   << problems.size()
@@ -288,82 +288,102 @@ void solve_TSP(int                     num_nodes,
 
     // Update optimal cost and optimal solution if integral solution was found.
     if (integral_sol) {
-      opt_cost = cost;
+      cost_opt = cost;
       x_opt = x;
     }
-
-    // Remove current problem from queue.
-    problems.pop();
   }
 }
 
-void find_components(int                       num_nodes,
-                     int                       num_edges,
-                     std::vector<Edge>         edges,
-                     const std::vector<double> &x,
-                     int                       &num_components,
-                     std::vector<int>          &components)
+int main(int argc, char **argv)
 {
-  // Mark all unassigned nodes with -1.
-  components.resize(num_nodes);
-  for (int n = 0; n < num_nodes; n++) {
-    components[n] = -1;
+  // Read problem from stdin.
+  std::string line;
+  // Read problem size.
+  std::getline(std::cin, line);
+  // Remove leading spaces.
+  while (line[0] == ' ') line = line.substr(1);
+  const int num_nodes = std::stoi(line.substr(0, line.find(" ")));
+  const int num_edges = std::stoi(line.substr(line.find(" ") + 1));
+  // Read graph.
+  std::vector<Edge> edges;
+  edges.resize(num_edges);
+  for (int e = 0; e < num_edges; e++) {
+    std::getline(std::cin, line);
+    // Remove leading spaces.
+    while (line[0] == ' ') line = line.substr(1);
+    edges[e].end1 = std::stoi(line.substr(0, line.find(" ")));
+    line = line.substr(line.find(" ") + 1);
+    edges[e].end2 = std::stoi(line.substr(0, line.find(" ")));
+    line = line.substr(line.find(" ") + 1);
+    edges[e].weight = std::stod(line);
   }
+  std::cout << "Loaded TSP with " << num_nodes << " nodes and "
+                                  << num_edges << " edges.\n";
 
-  // Component index
-  int c = 0;
-  // Node indices
-  int n1, n2;
-  // Find all connected components.
-  while (true) {
-    // Find an unassigned node.
-    n1 = -1;
-    for (int n = 0; n < num_nodes; n++) {
-      if (components[n] == -1) {
-        n1 = n;
-        break;
-      }
-    }
-    if (n1 == -1) {
-      // All nodes have been assigned.
+  // Check if the edge weights are integral.
+  // If so, we can optimize a bit more aggressively in some places.
+  bool integral_weights = true;
+  for (int e = 0; e < num_edges; e++) {
+    if (!is_integral(edges[e].weight)) {
+      integral_weights = false;
       break;
     }
-
-    // Assign node to current component.
-    components[n1] = c;
-    // Mark the entire connected component.
-    while (true) {
-      // Find an unassigned connected node.
-      n2 = -1;
-      for (int e = 0; e < num_edges; e++) {
-        // Skip edges that are not used in the current solution.
-        if (x[e] < tol) continue;
-        if (edges[e].end1 == n1 && components[edges[e].end2] == -1) {
-          n2 = edges[e].end2;
-          break;
-        }
-        if (edges[e].end2 == n1 && components[edges[e].end1] == -1) {
-          n2 = edges[e].end1;
-          break;
-        }
-      }
-      // No connected node found. Continue with next component.
-      if (n2 == -1) break;
-
-      // Assign the connected node to the current component.
-      components[n2] = c;
-      // Merge the two nodes.
-      for (int e = 0; e < num_edges; e++) {
-        if (edges[e].end1 == n2) {
-          edges[e].end1 = n1;
-        }
-        if (edges[e].end2 == n2) {
-          edges[e].end2 = n1;
-        }
-      }
-    }
-    c++;
   }
-  num_components = c;
+
+  std::cout << "Computation begins.\n";
+  // Start timer.
+  const auto t_start = std::chrono::high_resolution_clock::now();
+  // Solve TSP using Gurobi (for the LPs).
+  std::vector<double> x_opt;
+  int lp_solves;
+  int subtour_constraints;
+  try {
+    solve_TSP(num_nodes,
+              num_edges,
+              edges,
+              integral_weights,
+              x_opt,
+              lp_solves,
+              subtour_constraints);
+  }
+  catch (const GRBException &e) {
+    std::cerr << "Gurobi exception: " << e.getMessage() << std::endl;
+    std::exit(1);
+  }
+  // Stop timer.
+  const auto t_end = std::chrono::high_resolution_clock::now();
+  const std::chrono::duration<double> dtime = t_end - t_start;
+
+  std::cout << "Computation finished (" 
+            << std::fixed << std::setprecision(3)
+            << dtime.count() << "s).\n";
+
+  // Print additional information.
+  std::cout << "Solved a total of " << lp_solves << " LPs." << std::endl;
+  std::cout << "Added a total of " << subtour_constraints
+            << " subtour elimination constraints." << std::endl;
+
+  // Print optimal solution.
+  std::cout << "The best tour is:\n";
+  double c_optimal = 0.0;
+  // Set output format.
+  if (integral_weights) {
+    std::cout << std::setprecision(0);
+  }
+  else {
+    std::cout << std::setprecision(1);
+  }
+  for (int e = 0; e < num_edges; e++) {
+    // See if the edge is used.
+    if (x_opt[e] > 0.0) {
+      std::cout << edges[e].end1 << " "
+                << edges[e].end2 << " "
+                << edges[e].weight << std::endl;
+      c_optimal += x_opt[e]*edges[e].weight;
+    }
+  }
+  std::cout << "The cost of the best tour is: " << c_optimal << std::endl;
+
+  return 0;
 }
 
